@@ -6,7 +6,7 @@ import numpy as np
 import threading
 import time
 
-from src.detection.preprocessor import ROIPreprocessor, DEFAULT_ROI_POLY
+from src.detection.preprocessor import ROIPreprocessor, DEFAULT_ROI, DEFAULT_ROI_POLY
 from src.tracking.lane_counter import ProductionCounter
 
 ctk.set_appearance_mode("Dark")
@@ -17,6 +17,7 @@ class PinCounterApp(ctk.CTk):
     """
     Production Counter Desktop Application for 8-lane copper pin factory CCTV.
     Features:
+    - Dynamic machine-anchored optical flow stabilization to counteract camera wobble
     - 4-point perspective warp for top-down rectified pin analysis
     - Inverse perspective overlay projecting lane states back onto oblique camera view
     - CLAHE + HSV segmented mask preview
@@ -36,9 +37,10 @@ class PinCounterApp(ctk.CTk):
         self.current_video_path = None
         self.show_mask_view = False
         self.ui_update_pending = False
+        self.stabilize_enabled = True
         
-        # Calibrated upper guide bed ROI above the yellow machine clamp
-        self.preprocessor = ROIPreprocessor(roi_box=(0.38, 0.38, 0.50, 0.60), warp_size=(240, 160))
+        # Feeder bed ROI preprocessor with camera wobble stabilization
+        self.preprocessor = ROIPreprocessor(warp_size=(240, 160), enable_stabilizer=True)
         self.counter = ProductionCounter(num_lanes=8)
 
         self._setup_layout()
@@ -99,8 +101,16 @@ class PinCounterApp(ctk.CTk):
         )
         self.btn_reset.pack(pady=5, padx=20, fill="x")
 
+        self.stabilizer_switch = ctk.CTkSwitch(
+            self.right_frame,
+            text="Auto-Stabilize (Lock to Bed)",
+            command=self.toggle_stabilizer
+        )
+        self.stabilizer_switch.select()
+        self.stabilizer_switch.pack(pady=(8, 4), padx=20)
+
         self.mask_switch = ctk.CTkSwitch(self.right_frame, text="Show Pin Occupancy Mask", command=self.toggle_mask_view)
-        self.mask_switch.pack(pady=8, padx=20)
+        self.mask_switch.pack(pady=(4, 8), padx=20)
 
         self.lbl_timestamp = ctk.CTkLabel(self.right_frame, text="Timestamp: 00:00:00", font=("Arial", 14))
         self.lbl_timestamp.pack(pady=(8, 4))
@@ -135,6 +145,10 @@ class PinCounterApp(ctk.CTk):
         self.video_thread = None
         self.stop_stream = False
 
+    def toggle_stabilizer(self):
+        self.stabilize_enabled = (self.stabilizer_switch.get() == 1)
+        self.preprocessor.stabilizer_enabled = self.stabilize_enabled
+
     def browse_video(self):
         file_path = filedialog.askopenfilename(filetypes=[("Video Files", "*.mp4 *.avi *.mkv")])
         if file_path:
@@ -154,9 +168,10 @@ class PinCounterApp(ctk.CTk):
             
             ret, frame = self.cap.read()
             if ret:
-                rectified, pts_src, _, _ = self.preprocessor.warp(frame)
+                self.preprocessor.initialize_stabilizer(frame)
+                rectified, pts_src, _, _ = self.preprocessor.warp(frame, stabilize=self.stabilize_enabled)
                 preview = frame.copy()
-                cv2.polylines(preview, [pts_src], isClosed=True, color=(0, 0, 255), thickness=2)
+                cv2.polylines(preview, [pts_src], isClosed=True, color=(0, 255, 0), thickness=2)
                 self._render_frame(preview)
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
@@ -182,26 +197,28 @@ class PinCounterApp(ctk.CTk):
         rx, ry, rw, rh = roi
         if rw > 10 and rh > 10:
             norm_box = (ry / h, rx / w, (ry + rh) / h, (rx + rw) / w)
-            self.preprocessor.set_roi_box(norm_box)
+            self.preprocessor.set_roi_box(norm_box, frame=frame)
             self.counter.reset()
-            rectified, pts_src, _, _ = self.preprocessor.warp(frame)
+            rectified, pts_src, _, _ = self.preprocessor.warp(frame, stabilize=self.stabilize_enabled)
             preview = frame.copy()
             cv2.polylines(preview, [pts_src], isClosed=True, color=(0, 255, 0), thickness=2)
             self._render_frame(preview)
             messagebox.showinfo("ROI Updated", f"Feeder ROI calibrated!\nx=[{rx}:{rx+rw}], y=[{ry}:{ry+rh}]")
 
     def reset_roi(self):
-        self.preprocessor.set_roi_box((0.38, 0.38, 0.50, 0.60))
         self.counter.reset()
         if self.cap and self.cap.isOpened():
             curr_pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
             ret, frame = self.cap.read()
             if ret:
-                rectified, pts_src, _, _ = self.preprocessor.warp(frame)
+                self.preprocessor.set_roi_box(DEFAULT_ROI, frame=frame)
+                rectified, pts_src, _, _ = self.preprocessor.warp(frame, stabilize=self.stabilize_enabled)
                 preview = frame.copy()
-                cv2.polylines(preview, [pts_src], isClosed=True, color=(0, 0, 255), thickness=2)
+                cv2.polylines(preview, [pts_src], isClosed=True, color=(0, 255, 0), thickness=2)
                 self._render_frame(preview)
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, curr_pos)
+        else:
+            self.preprocessor.set_roi_box(DEFAULT_ROI)
 
     def reset_counter(self):
         self.counter.reset()
@@ -243,15 +260,17 @@ class PinCounterApp(ctk.CTk):
 
             fh, fw = frame.shape[:2]
 
-            # 1. Warp perspective to top-down rectified image
-            rectified, pts_src, M, M_inv = self.preprocessor.warp(frame)
+            # 1. Warp perspective to top-down rectified image (with wobble stabilization)
+            rectified, pts_src, M, M_inv = self.preprocessor.warp(frame, stabilize=self.stabilize_enabled)
             
             # 2. Track pin batch pulse on rectified channels
             total_count, delta_count, statuses, (y_top, y_bottom) = self.counter.process_frame(rectified)
 
             # 3. Draw overlays
-            # Red perspective ROI polygon boundary on original camera view
-            cv2.polylines(frame, [pts_src], isClosed=True, color=(0, 0, 255), thickness=2)
+            # Dynamic ROI polygon boundary (Green if locked by stabilizer, Red if static/lost)
+            is_locked = (self.stabilize_enabled and self.preprocessor.stabilizer and self.preprocessor.stabilizer.is_locked)
+            roi_color = (0, 255, 0) if is_locked else (0, 0, 255)
+            cv2.polylines(frame, [pts_src], isClosed=True, color=roi_color, thickness=2)
 
             # Project rectified inspection zones and lane dividers back onto original perspective view
             rw, rh = self.preprocessor.warp_w, self.preprocessor.warp_h
@@ -298,14 +317,15 @@ class PinCounterApp(ctk.CTk):
 
             # Live Machine State Banner on Video
             current_state = self.counter.state
+            lock_label = " [STABILIZED]" if is_locked else ""
             if current_state == "BATCH_ACTIVE":
-                banner_text = "STATUS: BATCH PULSE ACTIVE"
+                banner_text = f"STATUS: BATCH PULSE ACTIVE{lock_label}"
                 banner_color = (0, 255, 0)
             elif current_state == "COOLDOWN":
-                banner_text = f"STATUS: COOLDOWN ({self.counter.cooldown_timer})"
+                banner_text = f"STATUS: COOLDOWN ({self.counter.cooldown_timer}){lock_label}"
                 banner_color = (0, 165, 255)
             else:
-                banner_text = "STATUS: IDLE (WAITING FOR BATCH)"
+                banner_text = f"STATUS: IDLE (WAITING FOR BATCH){lock_label}"
                 banner_color = (200, 200, 200)
 
             # Draw banner above top-left corner of ROI

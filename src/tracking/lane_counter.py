@@ -96,12 +96,19 @@ class LanePinTracker:
         hsv = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2HSV)
         copper_mask = cv2.inRange(hsv, (5, 45, 60), (18, 200, 255))
 
-        # 3. Specular Highlights
+        # 3. Specular Highlights: Target glares with warm/copper chromaticity or adjacent to copper
+        # Rejects cold/neutral steel reflections and white background machinery
+        warm_specular = cv2.inRange(hsv, (0, 20, 160), (25, 255, 255))
+
         gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
-        _, specular_mask = cv2.threshold(gray, 175, 255, cv2.THRESH_BINARY)
+        _, bright_white = cv2.threshold(gray, 185, 255, cv2.THRESH_BINARY)
+        # Bright white specular glares are only retained if directly touching copper pixels
+        copper_dilated = cv2.dilate(copper_mask, np.ones((3, 3), np.uint8), iterations=1)
+        copper_adjacent_specular = cv2.bitwise_and(bright_white, copper_dilated)
 
         # 4. Multi-cue Fusion: bitwise OR
-        pin_mask = cv2.bitwise_or(copper_mask, specular_mask)
+        pin_mask = cv2.bitwise_or(copper_mask, warm_specular)
+        pin_mask = cv2.bitwise_or(pin_mask, copper_adjacent_specular)
 
         # 5. Tall vertical kernel to preserve vertical pin lines and eliminate square blobs
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))

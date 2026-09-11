@@ -1,16 +1,18 @@
 import cv2
 import numpy as np
 
-# Calibrated default ROI coordinates for Trial.mp4 feeder bed (ymin, xmin, ymax, xmax)
-# Isolates the flat black upper guide bed above the yellow machine clamp
-DEFAULT_ROI = (0.38, 0.38, 0.50, 0.60)
+from src.detection.stabilizer import MachineStabilizer
+
+# Calibrated default ROI coordinates for copper pin feeder bed (ymin, xmin, ymax, xmax)
+# Isolates the 8-lane ramp located between the yellow guide rollers
+DEFAULT_ROI = (0.58, 0.28, 0.70, 0.54)
 
 # Default 4-point polygon derived from DEFAULT_ROI
 DEFAULT_ROI_POLY = [
-    (0.38, 0.38),  # Top-Left (xmin, ymin)
-    (0.60, 0.38),  # Top-Right (xmax, ymin)
-    (0.60, 0.50),  # Bottom-Right (xmax, ymax)
-    (0.38, 0.50)   # Bottom-Left (xmin, ymax)
+    (0.28, 0.58),  # Top-Left (xmin, ymin)
+    (0.54, 0.58),  # Top-Right (xmax, ymin)
+    (0.54, 0.70),  # Bottom-Right (xmax, ymax)
+    (0.28, 0.70)   # Bottom-Left (xmin, ymax)
 ]
 
 
@@ -19,14 +21,19 @@ class ROIPreprocessor:
     Applies a 4-point perspective transform to extract a top-down rectified image
     of the 8-lane copper pin feeder bed, eliminating perspective distortion so all
     8 channels become vertical, uniform-width parallel slices.
+    
+    Includes dynamic MachineStabilizer to lock the ROI to the feeder bed under camera wobble.
     """
-    def __init__(self, roi_box=None, roi_polygon=None, warp_size=(240, 160)):
+    def __init__(self, roi_box=None, roi_polygon=None, warp_size=(240, 160), enable_stabilizer=True):
         """
         roi_box: tuple of (ymin, xmin, ymax, xmax) normalized coordinates
         roi_polygon: list of 4 (x, y) normalized coordinates [(x_tl, y_tl), (x_tr, y_tr), (x_br, y_br), (x_bl, y_bl)]
         warp_size: (width, height) of the rectified output image
+        enable_stabilizer: whether to track machine features to counteract camera wobble
         """
         self.warp_w, self.warp_h = warp_size
+        self.stabilizer_enabled = enable_stabilizer
+        self.stabilizer = MachineStabilizer() if enable_stabilizer else None
         
         if roi_box is not None:
             self.set_roi_box(roi_box)
@@ -43,12 +50,16 @@ class ROIPreprocessor:
             [0, self.warp_h - 1]
         ], dtype=np.float32)
 
-    def set_roi_polygon(self, roi_polygon):
-        """Sets the 4-corner polygon in normalized coordinates (x, y)."""
+    def set_roi_polygon(self, roi_polygon, frame=None):
+        """Sets the 4-corner polygon in normalized coordinates (x, y) and re-initializes stabilizer if frame provided."""
         if len(roi_polygon) == 4:
             self.roi_polygon = [(float(p[0]), float(p[1])) for p in roi_polygon]
+            if self.stabilizer:
+                self.stabilizer.reset()
+                if frame is not None:
+                    self.stabilizer.initialize(frame, self.roi_polygon)
 
-    def set_roi_box(self, roi_box):
+    def set_roi_box(self, roi_box, frame=None):
         """Converts a normalized (ymin, xmin, ymax, xmax) bounding box into 4 polygon corners."""
         ymin, xmin, ymax, xmax = roi_box
         self.roi_polygon = [
@@ -57,10 +68,21 @@ class ROIPreprocessor:
             (xmax, ymax),  # BR
             (xmin, ymax)   # BL
         ]
+        if self.stabilizer:
+            self.stabilizer.reset()
+            if frame is not None:
+                self.stabilizer.initialize(frame, self.roi_polygon)
 
-    def warp(self, frame):
+    def initialize_stabilizer(self, frame):
+        """Initializes the machine stabilizer anchor points on the given frame."""
+        if self.stabilizer and frame is not None:
+            return self.stabilizer.initialize(frame, self.roi_polygon)
+        return False
+
+    def warp(self, frame, stabilize=True):
         """
         Transforms the quadrilateral feeder bed in `frame` into a top-down rectified image.
+        Dynamically adjusts for camera wobble if stabilizer is active.
         Returns:
             rectified: (warp_h, warp_w, 3) image where lanes are perfectly vertical
             pts_src_px: (4, 2) int32 pixel coordinates on the original frame
@@ -72,10 +94,19 @@ class ROIPreprocessor:
 
         h, w = frame.shape[:2]
 
-        # Convert normalized coordinates to pixel locations
-        pts_src = np.array([
-            [p[0] * w, p[1] * h] for p in self.roi_polygon
-        ], dtype=np.float32)
+        # Auto-initialize stabilizer on the first frame if needed
+        if stabilize and self.stabilizer_enabled and self.stabilizer:
+            if not self.stabilizer.is_initialized:
+                self.stabilizer.initialize(frame, self.roi_polygon)
+
+        # Retrieve stabilized or static coordinates
+        if stabilize and self.stabilizer_enabled and self.stabilizer and self.stabilizer.is_initialized:
+            pts_src_px, _, is_locked = self.stabilizer.update(frame)
+            pts_src = pts_src_px.astype(np.float32)
+        else:
+            pts_src = np.array([
+                [p[0] * w, p[1] * h] for p in self.roi_polygon
+            ], dtype=np.float32)
 
         # Compute forward and inverse perspective matrices
         M = cv2.getPerspectiveTransform(pts_src, self.pts_dst)
