@@ -1,2 +1,5 @@
 .venv
 /src/train
+
+
+__pycache__
